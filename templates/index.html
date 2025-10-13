@@ -3110,6 +3110,9 @@
         © 2025 Guillaume SEVRIN
     </div>
 
+    <!-- Include translations -->
+    <script src="{{ url_for('static', filename='translations.js') }}"></script>
+    
     <script>
         // Global variables
         // Variables globales (accessibles depuis window pour la recherche)
@@ -3122,6 +3125,10 @@
 
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {
+            // Initialize language first
+            if (typeof initLanguage === 'function') {
+                initLanguage();
+            }
             initializeApp();
         });
 
