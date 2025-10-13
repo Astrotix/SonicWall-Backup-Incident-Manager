@@ -2133,6 +2133,40 @@
         .ranking-list > div::-webkit-scrollbar-thumb:hover {
             background: var(--primary-400);
         }
+
+        /* Language Selector */
+        .language-selector {
+            position: relative;
+        }
+
+        #language-select {
+            padding: 0.5rem 1rem;
+            border: 2px solid var(--primary-200);
+            border-radius: 8px;
+            background: white;
+            color: var(--gray-700);
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 0.9rem;
+        }
+
+        #language-select:hover {
+            border-color: var(--primary-400);
+            box-shadow: 0 2px 8px rgba(59, 130, 246, 0.1);
+        }
+
+        #language-select:focus {
+            outline: none;
+            border-color: var(--primary-500);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+
+        .header-content {
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+        }
     </style>
 </head>
 <body>
@@ -2236,7 +2270,15 @@
             <!-- Header -->
             <header class="header">
                 <div class="header-content">
-                    <h1 class="header-title">Firewall Management</h1>
+                    <h1 class="header-title" data-i18n="header.title">Firewall Management</h1>
+                    <div class="language-selector">
+                        <select id="language-select" onchange="changeLanguage(this.value)">
+                            <option value="en">🇬🇧 English</option>
+                            <option value="fr">🇫🇷 Français</option>
+                            <option value="es">🇪🇸 Español</option>
+                            <option value="it">🇮🇹 Italiano</option>
+                        </select>
+                    </div>
                     <div class="header-stats">
                         <div class="stat-item">
                             <div class="stat-number" id="total-firewalls">0</div>
