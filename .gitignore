@@ -53,3 +53,6 @@ Thumbs.db
 routes_to_add.txt
 temp/
 tmp/
+
+# Project specific exclusions
+SonicWall_Backup_Minimal/

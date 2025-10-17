@@ -1,10 +1,24 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_file
 import requests
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 import json
 import urllib3
-from models import db, Firewall
+from models import db, Firewall, ModuleResolutionStatus, RemediationAction, StateVerification, CSERemediationTimer
 import os
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image, KeepTogether
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.graphics.shapes import Drawing, Rect, Circle, String
+from reportlab.graphics.charts.barcharts import VerticalBarChart
+from reportlab.graphics.charts.piecharts import Pie
+from reportlab.graphics.charts.linecharts import HorizontalLineChart
+from reportlab.graphics import renderPDF
+from reportlab.graphics.widgets.markers import makeMarker
+import io
+from datetime import datetime, timedelta
 
 # Désactiver les avertissements SSL pour les certificats auto-signés
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -254,7 +268,7 @@ def update_firewall(firewall_id):
 @app.route('/api/firewalls/<int:firewall_id>', methods=['DELETE'])
 def delete_firewall(firewall_id):
     """
-    Supprimer un firewall
+    Supprimer un firewall et tous ses enregistrements liés
     """
     try:
         firewall = Firewall.query.get(firewall_id)
@@ -264,12 +278,28 @@ def delete_firewall(firewall_id):
                 'message': 'Firewall non trouvé'
             }), 404
         
+        # Supprimer d'abord tous les enregistrements liés
+        from models import ModuleResolutionStatus, RemediationAction, StateVerification, CSERemediationTimer
+        
+        # Supprimer les statuts de résolution
+        ModuleResolutionStatus.query.filter_by(firewall_id=firewall_id).delete()
+        
+        # Supprimer les actions de remédiation
+        RemediationAction.query.filter_by(firewall_id=firewall_id).delete()
+        
+        # Supprimer les vérifications d'état
+        StateVerification.query.filter_by(firewall_id=firewall_id).delete()
+        
+        # Supprimer les timers CSE
+        CSERemediationTimer.query.filter_by(firewall_id=firewall_id).delete()
+        
+        # Maintenant supprimer le firewall
         db.session.delete(firewall)
         db.session.commit()
         
         return jsonify({
             'success': True,
-            'message': 'Firewall supprimé avec succès'
+            'message': 'Firewall et toutes ses données supprimés avec succès'
         })
         
     except Exception as e:
@@ -3321,6 +3351,656 @@ def get_remediation_status(firewall_id, module_name):
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/remediation/resolve/<int:firewall_id>/<module_name>', methods=['POST'])
+def resolve_module_remediation(firewall_id, module_name):
+    """Marquer n'importe quel module comme résolu"""
+    try:
+        print(f"DEBUG: Resolving module {module_name} for firewall {firewall_id}")
+        from models import ModuleResolutionStatus, RemediationAction
+        from datetime import datetime
+        
+        firewall = Firewall.query.get(firewall_id)
+        if not firewall:
+            print(f"DEBUG: Firewall {firewall_id} not found")
+            return jsonify({'success': False, 'message': 'Firewall non trouvé'}), 404
+        
+        # Vérifier si le statut existe déjà
+        print(f"DEBUG: Checking existing status for {module_name}")
+        status = ModuleResolutionStatus.query.filter_by(firewall_id=firewall_id, module_name=module_name).first()
+        
+        if status:
+            print(f"DEBUG: Updating existing status for {module_name}")
+            # Mettre à jour le statut existant
+            status.is_resolved = True
+            status.resolved_at = datetime.utcnow()
+            status.verification_method = request.json.get('verification_method', 'manual_resolution')
+            status.notes = request.json.get('notes', 'Résolu manuellement depuis l\'audit')
+        else:
+            print(f"DEBUG: Creating new status for {module_name}")
+            # Créer un nouveau statut
+            status = ModuleResolutionStatus(
+                firewall_id=firewall_id,
+                module_name=module_name,
+                is_resolved=True,
+                resolved_at=datetime.utcnow(),
+                verification_method=request.json.get('verification_method', 'manual_resolution'),
+                notes=request.json.get('notes', 'Résolu manuellement depuis l\'audit')
+            )
+            db.session.add(status)
+        
+        # Créer l'action de résolution
+        action = RemediationAction(
+            firewall_id=firewall_id,
+            module_name=module_name,
+            action_type='resolve_remediation',
+            result_message=f'{module_name} remediation completed successfully',
+            executed_at=datetime.utcnow()
+        )
+        db.session.add(action)
+        
+        print(f"DEBUG: Committing changes for {module_name}")
+        db.session.commit()
+        print(f"DEBUG: Successfully resolved {module_name}")
+        
+        return jsonify({'success': True, 'message': f'{module_name} remediation marked as resolved'})
+        
+    except Exception as e:
+        print(f"ERROR in resolve_module_remediation for {module_name}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        db.session.rollback()
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/remediation/reset/<int:firewall_id>/<module_name>', methods=['DELETE'])
+def reset_module_remediation(firewall_id, module_name):
+    """Supprimer le statut de résolution d'un module"""
+    try:
+        from models import ModuleResolutionStatus, RemediationAction
+        
+        firewall = Firewall.query.get(firewall_id)
+        if not firewall:
+            return jsonify({'success': False, 'message': 'Firewall non trouvé'}), 404
+        
+        # Supprimer le statut de résolution
+        status = ModuleResolutionStatus.query.filter_by(firewall_id=firewall_id, module_name=module_name).first()
+        if status:
+            db.session.delete(status)
+        
+        # Supprimer les actions de remediation
+        actions = RemediationAction.query.filter_by(firewall_id=firewall_id, module_name=module_name).all()
+        for action in actions:
+            db.session.delete(action)
+        
+        db.session.commit()
+        return jsonify({'success': True, 'message': f'{module_name} remediation status reset'})
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/generate-pdf-report', methods=['POST'])
+def generate_pdf_report():
+    """
+    Génère un rapport PDF stylé avec les données de sécurité et remédiation
+    """
+    try:
+        data = request.json
+        firewall_ids = data.get('firewall_ids', [])
+        report_type = data.get('report_type', 'security_intervention')
+        include_remediation_history = data.get('include_remediation_history', True)
+        include_score_analysis = data.get('include_score_analysis', True)
+        
+        if not firewall_ids:
+            return jsonify({'success': False, 'message': 'Aucun firewall sélectionné'}), 400
+        
+        # Récupérer les firewalls sélectionnés
+        firewalls = Firewall.query.filter(Firewall.id.in_(firewall_ids)).all()
+        if not firewalls:
+            return jsonify({'success': False, 'message': 'Aucun firewall trouvé'}), 404
+        
+        # Générer le PDF
+        pdf_buffer = generate_security_report_pdf(
+            firewalls=firewalls,
+            report_type=report_type,
+            include_remediation_history=include_remediation_history,
+            include_score_analysis=include_score_analysis
+        )
+        
+        # Retourner le PDF
+        pdf_buffer.seek(0)
+        return send_file(
+            pdf_buffer,
+            as_attachment=True,
+            download_name=f'rapport_securite_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf',
+            mimetype='application/pdf'
+        )
+        
+    except Exception as e:
+        print(f"Erreur génération PDF: {str(e)}")
+        return jsonify({'success': False, 'message': f'Erreur génération PDF: {str(e)}'}), 500
+
+def create_modern_chart(data, chart_type='pie'):
+    """Crée un graphique moderne avec ReportLab"""
+    try:
+        drawing = Drawing(400, 300)
+        
+        # Vérifier et normaliser les données
+        if not isinstance(data, dict) or 'values' not in data or 'labels' not in data:
+            print(f"Données invalides: {data}")
+            return create_error_chart("Données invalides")
+        
+        values = data['values']
+        labels = data['labels']
+        
+        # S'assurer que values est une liste
+        if not isinstance(values, list):
+            values = [values] if isinstance(values, (int, float)) else []
+        
+        # S'assurer que labels est une liste
+        if not isinstance(labels, list):
+            labels = [labels] if isinstance(labels, str) else []
+        
+        if chart_type == 'pie':
+            pie = Pie()
+            pie.x = 150
+            pie.y = 50
+            pie.width = 200
+            pie.height = 200
+            
+            if not values or sum(values) == 0:
+                # Graphique vide stylé
+                empty_circle = Circle(250, 150, 80)
+                empty_circle.fillColor = colors.HexColor('#E8E8E8')
+                empty_circle.strokeColor = colors.HexColor('#CCCCCC')
+                empty_circle.strokeWidth = 3
+                drawing.add(empty_circle)
+                
+                empty_text = String(250, 150, "Aucune donnée", textAnchor='middle')
+                empty_text.fontName = 'Helvetica-Bold'
+                empty_text.fontSize = 14
+                empty_text.fillColor = colors.HexColor('#666666')
+                drawing.add(empty_text)
+                return drawing
+            
+            pie.data = values
+            pie.labels = labels
+            pie.slices.strokeWidth = 3
+            pie.slices.strokeColor = colors.white
+            
+            # Couleurs modernes et vives
+            modern_colors = [
+                colors.HexColor('#00C851'),  # Vert moderne
+                colors.HexColor('#FF4444'),  # Rouge moderne
+                colors.HexColor('#FF8800'),  # Orange moderne
+                colors.HexColor('#33B5E5'),  # Bleu moderne
+                colors.HexColor('#AA66CC'),  # Violet moderne
+                colors.HexColor('#FFBB33'),  # Jaune moderne
+            ]
+            
+            for i, color in enumerate(modern_colors[:len(values)]):
+                if i < len(pie.slices):
+                    pie.slices[i].fillColor = color
+            
+            drawing.add(pie)
+            
+            # Titre moderne
+            title = String(250, 280, data.get('title', 'Security Status'), textAnchor='middle')
+            title.fontName = 'Helvetica-Bold'
+            title.fontSize = 16
+            title.fillColor = colors.HexColor('#2E3440')
+            drawing.add(title)
+        
+        elif chart_type == 'bar':
+            chart = VerticalBarChart()
+            chart.x = 50
+            chart.y = 50
+            chart.width = 300
+            chart.height = 200
+            
+            if not values or max(values) == 0:
+                # Graphique vide stylé
+                empty_text = String(200, 150, "Aucune donnée disponible", textAnchor='middle')
+                empty_text.fontName = 'Helvetica-Bold'
+                empty_text.fontSize = 14
+                empty_text.fillColor = colors.HexColor('#666666')
+                drawing.add(empty_text)
+                return drawing
+            
+            chart.data = values
+            chart.categoryAxis.categoryNames = labels
+            chart.valueAxis.valueMin = 0
+            chart.valueAxis.valueMax = max(values) * 1.3 if max(values) > 0 else 1
+            
+            # Couleurs modernes pour les barres
+            modern_colors = [
+                colors.HexColor('#00C851'),  # Vert moderne
+                colors.HexColor('#FF4444'),  # Rouge moderne
+                colors.HexColor('#FF8800'),  # Orange moderne
+                colors.HexColor('#33B5E5'),  # Bleu moderne
+            ]
+            
+            for i in range(len(values)):
+                if i < len(chart.bars):
+                    chart.bars[i].fillColor = modern_colors[i % len(modern_colors)]
+            
+            drawing.add(chart)
+            
+            # Titre moderne
+            title = String(200, 280, data.get('title', 'Security Metrics'), textAnchor='middle')
+            title.fontName = 'Helvetica-Bold'
+            title.fontSize = 16
+            title.fillColor = colors.HexColor('#2E3440')
+            drawing.add(title)
+        
+        return drawing
+    except Exception as e:
+        print(f"Erreur création graphique moderne: {str(e)}")
+        return create_error_chart(f"Erreur: {str(e)}")
+
+def create_error_chart(message):
+    """Crée un graphique d'erreur"""
+    error_drawing = Drawing(400, 300)
+    error_text = String(200, 150, message, textAnchor='middle')
+    error_text.fontName = 'Helvetica-Bold'
+    error_text.fontSize = 12
+    error_text.fillColor = colors.HexColor('#FF4444')
+    error_drawing.add(error_text)
+    return error_drawing
+
+def create_modern_progress_bar(value, max_value=100, width=300, height=30):
+    """Crée une barre de progression moderne et stylée"""
+    try:
+        drawing = Drawing(width + 60, height + 20)
+        
+        # Fond moderne avec coins arrondis (simulé)
+        bg_rect = Rect(0, 0, width, height)
+        bg_rect.fillColor = colors.HexColor('#E8E8E8')
+        bg_rect.strokeColor = colors.HexColor('#CCCCCC')
+        bg_rect.strokeWidth = 2
+        drawing.add(bg_rect)
+        
+        # Barre de progression moderne
+        progress_width = (value / max_value) * width
+        progress_rect = Rect(0, 0, progress_width, height)
+        
+        # Couleurs modernes basées sur la valeur
+        if value >= 80:
+            progress_rect.fillColor = colors.HexColor('#00C851')  # Vert moderne
+        elif value >= 60:
+            progress_rect.fillColor = colors.HexColor('#FF8800')  # Orange moderne
+        else:
+            progress_rect.fillColor = colors.HexColor('#FF4444')  # Rouge moderne
+        
+        drawing.add(progress_rect)
+        
+        # Texte moderne avec ombre
+        text = String(width/2, height/2 - 2, f"{value:.1f}%", textAnchor='middle')
+        text.fontName = 'Helvetica-Bold'
+        text.fontSize = 14
+        text.fillColor = colors.white
+        drawing.add(text)
+        
+        # Bordure brillante
+        border_rect = Rect(0, 0, width, height)
+        border_rect.fillColor = None
+        border_rect.strokeColor = colors.HexColor('#FFFFFF')
+        border_rect.strokeWidth = 1
+        drawing.add(border_rect)
+        
+        return drawing
+    except Exception as e:
+        print(f"Erreur création barre moderne: {str(e)}")
+        error_drawing = Drawing(width + 60, height + 20)
+        error_text = String(width/2, height/2, f"Erreur: {str(e)}", textAnchor='middle')
+        error_text.fontName = 'Helvetica'
+        error_text.fontSize = 8
+        error_text.fillColor = colors.red
+        error_drawing.add(error_text)
+        return error_drawing
+
+def generate_security_report_pdf(firewalls, report_type='security_intervention', include_remediation_history=True, include_score_analysis=True):
+    """
+    Génère un rapport PDF simple avec graphiques fonctionnels
+    """
+    try:
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=0.5*inch, bottomMargin=0.5*inch, leftMargin=0.5*inch, rightMargin=0.5*inch)
+        
+        # Styles simples
+        styles = getSampleStyleSheet()
+        
+        # Style titre principal
+        title_style = ParagraphStyle(
+            'Title',
+            parent=styles['Heading1'],
+            fontSize=24,
+            spaceAfter=20,
+            alignment=TA_CENTER,
+            textColor=colors.darkblue,
+            fontName='Helvetica-Bold'
+        )
+        
+        # Style sous-titre
+        subtitle_style = ParagraphStyle(
+            'Subtitle',
+            parent=styles['Heading2'],
+            fontSize=16,
+            spaceAfter=15,
+            textColor=colors.darkred,
+            fontName='Helvetica-Bold'
+        )
+        
+        # Style section
+        section_style = ParagraphStyle(
+            'Section',
+            parent=styles['Heading3'],
+            fontSize=14,
+            spaceAfter=10,
+            textColor=colors.darkgreen,
+            fontName='Helvetica-Bold'
+        )
+        
+        # Style texte normal
+        normal_style = ParagraphStyle(
+            'Normal',
+            parent=styles['Normal'],
+            fontSize=11,
+            spaceAfter=8,
+            textColor=colors.black,
+            fontName='Helvetica'
+        )
+        
+        # Style tableau simple
+        table_style = TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE')
+        ])
+        
+        story = []
+        
+        # En-tête du rapport
+        story.append(Paragraph("RAPPORT D'INTERVENTION SECURITE", title_style))
+        story.append(Paragraph("SonicWall Backup Incident Manager", subtitle_style))
+        story.append(Paragraph(f"Genere le {datetime.now().strftime('%d/%m/%Y a %H:%M')}", normal_style))
+        story.append(Spacer(1, 30))
+        
+        # Calculer les statistiques globales
+        total_firewalls = len(firewalls)
+        total_remediation_actions = 0
+        total_resolved_modules = 0
+        total_pending_modules = 0
+        avg_security_score = 0
+        
+        for firewall in firewalls:
+            remediation_actions = RemediationAction.query.filter_by(firewall_id=firewall.id).all()
+            total_remediation_actions += len(remediation_actions)
+            
+            resolved_modules = ModuleResolutionStatus.query.filter_by(firewall_id=firewall.id, is_resolved=True).all()
+            total_resolved_modules += len(resolved_modules)
+            
+            pending_modules = ModuleResolutionStatus.query.filter_by(firewall_id=firewall.id, is_resolved=False).all()
+            total_pending_modules += len(pending_modules)
+            
+            # Calculer le score de sécurité
+            total_modules = len(resolved_modules) + len(pending_modules)
+            if total_modules > 0:
+                firewall_score = (len(resolved_modules) / total_modules) * 100
+                avg_security_score += firewall_score
+        
+        if total_firewalls > 0:
+            avg_security_score = avg_security_score / total_firewalls
+        
+        # Résumé exécutif
+        story.append(Paragraph("RESUME EXECUTIF", section_style))
+        
+        summary_data = [
+            ['METRIQUES CLES', 'VALEURS'],
+            ['Firewalls analyses', str(total_firewalls)],
+            ['Actions de remediation', str(total_remediation_actions)],
+            ['Modules resolus', str(total_resolved_modules)],
+            ['Modules en attente', str(total_pending_modules)],
+            ['Score securite moyen', f'{avg_security_score:.1f}%'],
+            ['Taux de resolution', f'{round((total_resolved_modules / (total_resolved_modules + total_pending_modules)) * 100, 1) if (total_resolved_modules + total_pending_modules) > 0 else 0}%']
+        ]
+        
+        summary_table = Table(summary_data, colWidths=[3*inch, 2*inch])
+        summary_table.setStyle(table_style)
+        story.append(summary_table)
+        story.append(Spacer(1, 25))
+        
+        # Graphiques simples
+        story.append(Paragraph("ANALYSE VISUELLE", section_style))
+        
+        # Graphique en secteurs simple
+        try:
+            chart_data = {
+                'title': 'Repartition des Modules',
+                'labels': ['Modules Resolus', 'Modules en Attente'],
+                'values': [total_resolved_modules, total_pending_modules]
+            }
+            
+            pie_chart = create_modern_chart(chart_data, 'pie')
+            story.append(pie_chart)
+            story.append(Spacer(1, 20))
+        except Exception as e:
+            print(f"Erreur graphique secteurs: {str(e)}")
+            story.append(Paragraph(f"Erreur graphique: {str(e)}", normal_style))
+        
+        # Barre de progression simple
+        try:
+            story.append(Paragraph("Score de Securite Global", normal_style))
+            progress_bar = create_modern_progress_bar(avg_security_score)
+            story.append(progress_bar)
+            story.append(Spacer(1, 20))
+        except Exception as e:
+            print(f"Erreur barre progression: {str(e)}")
+            story.append(Paragraph(f"Erreur barre progression: {str(e)}", normal_style))
+        
+        # Recommandations
+        story.append(Paragraph("RECOMMANDATIONS", section_style))
+        
+        recommendations = []
+        if avg_security_score < 70:
+            recommendations.append("Score de securite critique - Actions immediates requises")
+        elif avg_security_score < 85:
+            recommendations.append("Score de securite moyen - Ameliorations recommandees")
+        else:
+            recommendations.append("Score de securite excellent - Maintenance preventive")
+        
+        if total_pending_modules > total_resolved_modules:
+            recommendations.append("Nombre eleve de modules en attente - Prioriser les remediations")
+        
+        if total_remediation_actions == 0:
+            recommendations.append("Aucune action de remediation - Verifier la configuration")
+        
+        for rec in recommendations:
+            story.append(Paragraph(f"• {rec}", normal_style))
+        
+        story.append(Spacer(1, 25))
+        
+        # Détail par firewall simple
+        for i, firewall in enumerate(firewalls):
+            if i > 0:
+                story.append(PageBreak())
+            
+            # En-tête du firewall
+            story.append(Paragraph(f"FIREWALL: {firewall.name or 'Sans nom'}", subtitle_style))
+            story.append(Paragraph(f"IP: {firewall.ip} | Utilisateur: {firewall.username}", normal_style))
+            story.append(Paragraph(f"Statut: {firewall.status.upper()}", normal_style))
+            story.append(Spacer(1, 20))
+            
+            # Calculer le score de sécurité pour ce firewall
+            resolved_modules = ModuleResolutionStatus.query.filter_by(firewall_id=firewall.id, is_resolved=True).all()
+            pending_modules = ModuleResolutionStatus.query.filter_by(firewall_id=firewall.id, is_resolved=False).all()
+            total_modules = len(resolved_modules) + len(pending_modules)
+            firewall_score = (len(resolved_modules) / total_modules) * 100 if total_modules > 0 else 0
+            
+            # Score de sécurité avec barre simple
+            story.append(Paragraph(f"Score de Securite: {firewall_score:.1f}%", normal_style))
+            try:
+                firewall_progress = create_modern_progress_bar(firewall_score)
+                story.append(firewall_progress)
+            except Exception as e:
+                print(f"Erreur barre progression firewall: {str(e)}")
+                story.append(Paragraph(f"Erreur barre progression: {str(e)}", normal_style))
+            story.append(Spacer(1, 15))
+            
+            # Informations générales
+            story.append(Paragraph("INFORMATIONS GENERALES", section_style))
+            
+            firewall_data = [
+                ['Propriete', 'Valeur'],
+                ['Nom', firewall.name or 'Non defini'],
+                ['Adresse IP', firewall.ip],
+                ['Utilisateur', firewall.username],
+                ['Statut', firewall.status],
+                ['Derniere verification', firewall.last_checked.strftime('%d/%m/%Y %H:%M') if firewall.last_checked else 'Jamais'],
+                ['Cree le', firewall.created_at.strftime('%d/%m/%Y %H:%M') if firewall.created_at else 'Inconnu'],
+                ['Score securite', f'{firewall_score:.1f}%']
+            ]
+            
+            firewall_table = Table(firewall_data, colWidths=[2*inch, 3*inch])
+            firewall_table.setStyle(table_style)
+            story.append(firewall_table)
+            story.append(Spacer(1, 25))
+            
+            # Historique des remédiations
+            if include_remediation_history:
+                story.append(Paragraph("HISTORIQUE DES REMEDIATIONS", section_style))
+                
+                remediation_actions = RemediationAction.query.filter_by(firewall_id=firewall.id).order_by(RemediationAction.executed_at.desc()).all()
+                
+                if remediation_actions:
+                    remediation_data = [['Date', 'Module', 'Action', 'Succes', 'Details']]
+                    
+                    for action in remediation_actions:
+                        success_text = "OUI" if action.success else "NON"
+                        module_name = action.module_name.replace('_', ' ').title()
+                        action_type = action.action_type.replace('_', ' ').title()
+                        
+                        remediation_data.append([
+                            action.executed_at.strftime('%d/%m/%Y %H:%M') if action.executed_at else 'Inconnu',
+                            module_name,
+                            action_type,
+                            success_text,
+                            action.result_message[:50] + '...' if action.result_message and len(action.result_message) > 50 else action.result_message or 'N/A'
+                        ])
+                    
+                    remediation_table = Table(remediation_data, colWidths=[1.2*inch, 1.2*inch, 1.5*inch, 0.8*inch, 2.3*inch])
+                    remediation_table.setStyle(table_style)
+                    story.append(remediation_table)
+                else:
+                    story.append(Paragraph("Aucune action de remediation enregistree.", normal_style))
+                
+                story.append(Spacer(1, 25))
+            
+            # Statut des modules avec graphique
+            story.append(Paragraph("STATUT DES MODULES DE SECURITE", section_style))
+            
+            module_statuses = ModuleResolutionStatus.query.filter_by(firewall_id=firewall.id).all()
+            
+            # Graphique des modules
+            try:
+                if module_statuses:
+                    module_names = [status.module_name.replace('_', ' ').title() for status in module_statuses]
+                    module_values = [1 if status.is_resolved else 0 for status in module_statuses]
+                else:
+                    module_names = ['Aucun module']
+                    module_values = [0]
+                
+                module_chart_data = {
+                    'title': 'Statut des Modules',
+                    'labels': module_names,
+                    'values': module_values
+                }
+                
+                module_chart = create_modern_chart(module_chart_data, 'bar')
+                story.append(module_chart)
+                story.append(Spacer(1, 20))
+            except Exception as e:
+                print(f"Erreur graphique modules: {str(e)}")
+                story.append(Paragraph(f"Erreur graphique modules: {str(e)}", normal_style))
+            
+            # Tableau détaillé des modules
+            if module_statuses:
+                module_data = [['Module', 'Statut', 'Resolu le', 'Methode', 'Notes']]
+                
+                for status in module_statuses:
+                    status_text = "Resolu" if status.is_resolved else "En attente"
+                    
+                    module_data.append([
+                        status.module_name.replace('_', ' ').title(),
+                        status_text,
+                        status.resolved_at.strftime('%d/%m/%Y %H:%M') if status.resolved_at else 'N/A',
+                        status.verification_method or 'N/A',
+                        status.notes[:30] + '...' if status.notes and len(status.notes) > 30 else status.notes or 'N/A'
+                    ])
+                
+                module_table = Table(module_data, colWidths=[1.5*inch, 1*inch, 1.2*inch, 1.3*inch, 2*inch])
+                module_table.setStyle(table_style)
+                story.append(module_table)
+            else:
+                story.append(Paragraph("Aucun statut de module enregistre.", normal_style))
+            
+            story.append(Spacer(1, 25))
+            
+            # Vérifications d'état
+            story.append(Paragraph("VERIFICATIONS D'ETAT", section_style))
+            
+            state_verifications = StateVerification.query.filter_by(firewall_id=firewall.id).order_by(StateVerification.verified_at.desc()).limit(10).all()
+            
+            if state_verifications:
+                verification_data = [['Date', 'Module', 'Resolu', 'Notes']]
+                
+                for verification in state_verifications:
+                    resolved_text = "OUI" if verification.was_resolved else "NON"
+                    
+                    verification_data.append([
+                        verification.verified_at.strftime('%d/%m/%Y %H:%M') if verification.verified_at else 'Inconnu',
+                        verification.module_name.replace('_', ' ').title(),
+                        resolved_text,
+                        verification.notes[:40] + '...' if verification.notes and len(verification.notes) > 40 else verification.notes or 'N/A'
+                    ])
+                
+                verification_table = Table(verification_data, colWidths=[1.5*inch, 1.5*inch, 0.8*inch, 2.2*inch])
+                verification_table.setStyle(table_style)
+                story.append(verification_table)
+            else:
+                story.append(Paragraph("Aucune verification d'etat enregistree.", normal_style))
+        
+        # Pied de page
+        story.append(Spacer(1, 30))
+        story.append(Paragraph("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", normal_style))
+        story.append(Spacer(1, 10))
+        story.append(Paragraph("Rapport genere automatiquement par SonicWall Backup Incident Manager", normal_style))
+        story.append(Spacer(1, 10))
+        story.append(Paragraph("Ce rapport contient des informations sensibles - A traiter de maniere confidentielle", normal_style))
+        
+        # Construire le PDF
+        doc.build(story)
+        buffer.seek(0)
+        return buffer
+        
+    except Exception as e:
+        print(f"Erreur generation PDF: {str(e)}")
+        # Retourner un PDF d'erreur simple
+        error_buffer = io.BytesIO()
+        error_doc = SimpleDocTemplate(error_buffer, pagesize=A4)
+        error_story = []
+        error_story.append(Paragraph("ERREUR GENERATION RAPPORT", getSampleStyleSheet()['Heading1']))
+        error_story.append(Paragraph(f"Erreur: {str(e)}", getSampleStyleSheet()['Normal']))
+        error_doc.build(error_story)
+        error_buffer.seek(0)
+        return error_buffer
 
 if __name__ == '__main__':
     print("=" * 60)
