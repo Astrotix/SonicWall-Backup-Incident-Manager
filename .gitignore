@@ -23,10 +23,10 @@ wheels/
 .installed.cfg
 *.egg
 
-# Database
-*.db
+# Database - exclude backup files but allow empty databases
+*.db.backup
 *.db-journal
-instance/
+instance/*.db.backup
 
 # Backup files
 *_backup_*.py
